@@ -1,0 +1,116 @@
+name: Topla
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * *"
+    - cron: "25 12 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: topla
+  cancel-in-progress: false
+
+env:
+  TZ: Europe/Istanbul
+  PYTHONUTF8: "1"
+
+jobs:
+  topla:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Kod (main)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Veri dalı
+        uses: actions/checkout@v4
+        with:
+          ref: veri
+          path: veri
+
+      - name: Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Canlı oran topla ve dışa aktar
+        shell: bash
+        run: |
+          set +e
+          set +o pipefail
+          set -u
+
+          git -C veri config user.name "github-actions[bot]"
+          git -C veri config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          export_and_push() {
+            local export_rc=0
+            python export.py --db /tmp/live.db --out-dir veri
+            export_rc=$?
+            if [ "$export_rc" -ne 0 ]; then
+              echo "[$(date '+%H:%M:%S')] UYARI: export.py çıkış kodu ${export_rc}"
+              return 0
+            fi
+
+            if [ -n "$(git -C veri status --porcelain)" ]; then
+              local ts
+              ts="$(date '+%Y-%m-%d %H:%M:%S')"
+              git -C veri add -A
+              if ! git -C veri commit -m "veri ${ts}"; then
+                echo "[$(date '+%H:%M:%S')] UYARI: git commit başarısız"
+                return 0
+              fi
+            fi
+
+            local ahead
+            ahead="$(git -C veri rev-list --count origin/veri..HEAD 2>/dev/null || echo 0)"
+            if [ "${ahead:-0}" -le 0 ]; then
+              return 0
+            fi
+
+            local pushed=0
+            local attempt
+            for attempt in 1 2 3; do
+              if git -C veri push origin HEAD:veri; then
+                pushed=1
+                break
+              fi
+              echo "[$(date '+%H:%M:%S')] push denemesi ${attempt}/3 başarısız"
+              if [ "$attempt" -lt 3 ]; then
+                if ! git -C veri pull --rebase origin veri; then
+                  echo "[$(date '+%H:%M:%S')] pull --rebase başarısız (deneme ${attempt}/3)"
+                  git -C veri rebase --abort >/dev/null 2>&1 || true
+                fi
+                sleep 2
+              fi
+            done
+
+            if [ "$pushed" -eq 0 ]; then
+              echo "[$(date '+%H:%M:%S')] UYARI: veri dalına push 3 denemede başarısız oldu"
+            fi
+            return 0
+          }
+
+          python collect.py --db /tmp/live.db --max-runtime-min 335 &
+          collect_pid=$!
+
+          elapsed_since_export=0
+          while kill -0 "$collect_pid" 2>/dev/null; do
+            sleep 5
+            elapsed_since_export=$((elapsed_since_export + 5))
+            if [ "$elapsed_since_export" -ge 1500 ] && kill -0 "$collect_pid" 2>/dev/null; then
+              export_and_push
+              elapsed_since_export=0
+            fi
+          done
+
+          wait "$collect_pid"
+          collect_rc=$?
+
+          export_and_push
+          exit "$collect_rc"
